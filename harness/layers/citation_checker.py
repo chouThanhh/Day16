@@ -59,7 +59,35 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+import re
+import unicodedata
+
 from harness.middleware import Middleware
+
+_WS_RE = re.compile(r"\s+")
+
+
+def _norm(text: str) -> str:
+    """Casefold + NFC + gộp khoảng trắng — CÙNG PHÉP CHUẨN HOÁ scorer dùng
+    (`arena/scorer.py::_norm`). Chỉ dùng để SO KHỚP, không bao giờ ghi đè
+    lên `claim["text"]`."""
+    if not isinstance(text, str):
+        text = "" if text is None else str(text)
+    return _WS_RE.sub(" ", unicodedata.normalize("NFC", text).casefold()).strip()
+
+
+def _norm_lines(body: str) -> tuple:
+    return tuple(line for line in (_norm(raw) for raw in body.splitlines()) if line)
+
+
+def _quoted_in(text: str, body: str) -> bool:
+    """Đúng phép chấm của scorer: claim (chuẩn hoá) là SUBSTRING của MỘT
+    DÒNG (chuẩn hoá) trong body — không phải bằng tuyệt đối cả dòng, và
+    không phải "nằm trong" cả khối văn bản."""
+    needle = _norm(text)
+    if not needle:
+        return False
+    return any(needle in line for line in _norm_lines(body))
 
 
 class CitationChecker(Middleware):
@@ -68,16 +96,23 @@ class CitationChecker(Middleware):
     name = "citation_checker"
 
     def after_agent(self, ctx, report):
-        # TODO (§11): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; bỏ qua nếu rỗng hoặc ctx.corpus là None.
-        #  2. Với mỗi claim, gọi ctx.corpus.get(claim["doc_id"]).
-        #     Nếu tài liệu tồn tại VÀ claim["text"] khớp NGUYÊN VĂN một
-        #     DÒNG trong body của nó (không phải chỉ "nằm trong body")
-        #     -> trích dẫn đã đúng, giữ nguyên claim.
-        #  3. Nếu không: tìm trong ctx.corpus.docs tài liệu đầu tiên thoả
-        #     doc.body in ctx.observed_text  và  claim["text"] khớp
-        #     nguyên văn một DÒNG của doc.body -> đó là nguồn thật.
-        #     Đổi doc_id sang nó, GIỮ NGUYÊN text.
-        #  4. Không tìm được nguồn nào -> để `critic` xử lý, đừng bịa doc_id.
-        #  5. Cập nhật report["citations"] = danh sách doc_id đã sắp xếp.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims or ctx.corpus is None:
+            return report
+
+        for claim in claims:
+            text = claim.get("text", "")
+            doc = ctx.corpus.get(claim.get("doc_id"))
+            if doc is not None and _quoted_in(text, doc.body):
+                continue  # trích dẫn đã đúng
+
+            for candidate in ctx.corpus.docs:
+                if candidate.body in ctx.observed_text and _quoted_in(text, candidate.body):
+                    claim["doc_id"] = candidate.doc_id
+                    break
+            # Không tìm được nguồn nào -> để critic xử lý, không bịa doc_id.
+
+        report["citations"] = sorted(
+            {c["doc_id"] for c in claims if c.get("doc_id")}
+        )
+        return report

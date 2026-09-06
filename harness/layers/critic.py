@@ -70,7 +70,40 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+import re
+import unicodedata
+
 from harness.middleware import Middleware
+
+#: Liên từ dùng để ghép hai nửa câu lấy từ hai tài liệu mâu thuẫn.
+_JOINER = " và "
+
+_WS_RE = re.compile(r"\s+")
+
+
+def _norm(text: str) -> str:
+    """Cùng phép chuẩn hoá scorer dùng (`arena/scorer.py::_norm`) — chỉ để
+    SO KHỚP, không bao giờ ghi đè lên chữ của claim."""
+    if not isinstance(text, str):
+        text = "" if text is None else str(text)
+    return _WS_RE.sub(" ", unicodedata.normalize("NFC", text).casefold()).strip()
+
+
+def _quoted_in(text: str, body: str) -> bool:
+    needle = _norm(text)
+    if not needle:
+        return False
+    return any(needle in _norm(raw) for raw in body.splitlines() if raw.strip())
+
+
+def _find_doc_id(ctx, text: str):
+    """Tài liệu nào (đã quan sát) chứa `text` NGUYÊN VĂN một dòng?"""
+    if not text:
+        return None
+    for doc in ctx.corpus.docs if ctx.corpus is not None else ():
+        if doc.body in ctx.observed_text and _quoted_in(text, doc.body):
+            return doc.doc_id
+    return None
 
 
 class Critic(Middleware):
@@ -79,16 +112,40 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims:
+            return report
+
+        kept = []
+        forced_abstain = False
+
+        for claim in claims:
+            text = claim.get("text", "")
+            if ctx.saw(text):
+                kept.append(claim)
+                continue
+
+            if _JOINER in text:
+                left, right = text.split(_JOINER, 1)
+                left_doc = _find_doc_id(ctx, left)
+                right_doc = _find_doc_id(ctx, right)
+                if left_doc and right_doc and left_doc != right_doc:
+                    kept.append({**claim, "text": left, "doc_id": left_doc})
+                    kept.append({**claim, "text": right, "doc_id": right_doc})
+                    forced_abstain = True
+                    continue
+
+            # Không giữ nguyên được, không tách được -> bịa. Bỏ claim.
+
+        if not kept:
+            report["abstain"] = True
+            report["claims"] = []
+            report["citations"] = []
+            report["answer"] = "Không đủ căn cứ trong tài liệu để trả lời."
+            return report
+
+        if forced_abstain:
+            report["abstain"] = True
+        report["claims"] = kept
+        report["citations"] = sorted({c["doc_id"] for c in kept if c.get("doc_id")})
+        return report
